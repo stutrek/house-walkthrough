@@ -9,6 +9,7 @@
   #hud { position: fixed; left: 14px; top: 12px; padding: 8px 12px; background: rgba(20,24,30,.62); border-radius: 8px; pointer-events: none; }
   #hud b { font-size: 15px; }
   #cross { position: fixed; left: 50%; top: 50%; width: 6px; height: 6px; margin: -3px; border-radius: 50%; background: rgba(255,255,255,.75); pointer-events: none; }
+  #map { position: fixed; right: 14px; bottom: 14px; border-radius: 8px; pointer-events: none; }
   #start { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; background: rgba(20,24,30,.55); cursor: pointer; }
   #card { max-width: 430px; padding: 24px 28px; background: rgba(20,24,30,.92); border-radius: 12px; }
   #card h1 { margin: 0 0 10px; font-size: 22px; }
@@ -22,6 +23,7 @@
 <body>
 <div id="hud"></div>
 <div id="cross"></div>
+<canvas id="map"></canvas>
 <div id="start"><div id="card">
   <h1>House walkthrough</h1>
   <table>
@@ -725,6 +727,62 @@ function draw() {
   camera.position.set(P.x, P.eye, -P.y);
   camera.rotation.set(P.pitch, -P.yaw, 0);
   renderer.render(scene3, camera);
+  drawMap();
+}
+
+// ---- the wireframe map: the floor you're on, redrawn only when the floor or plan changes ----
+const MAP = { x0: -5, y0: -5, w: 66, h: 57, s: 4.3 }, mapEl = document.getElementById("map"), mapDpr = Math.min(devicePixelRatio, 2);
+mapEl.width = MAP.w * MAP.s * mapDpr; mapEl.height = MAP.h * MAP.s * mapDpr;
+mapEl.style.width = MAP.w * MAP.s + "px"; mapEl.style.height = MAP.h * MAP.s + "px";
+const mx = (x) => (x - MAP.x0) * MAP.s, my = (y) => (MAP.y0 + MAP.h - y) * MAP.s;
+let mapKey = "", mapBase = null;
+function outline(c, a, close = true) {
+  c.beginPath();
+  for (let i = 0; i < a.length; i += 2) (i ? c.lineTo(mx(a[i]), my(a[i + 1])) : c.moveTo(mx(a[i]), my(a[i + 1])));
+  if (close) c.closePath();
+  c.stroke();
+}
+function buildMap(plan, level) {
+  const off = document.createElement("canvas"); off.width = mapEl.width; off.height = mapEl.height;
+  const c = off.getContext("2d"), scene = DATA.scenes[plan], lv = baked[plan][level], stair = DATA.mats.indexOf("stair"), terrace = DATA.mats.indexOf("terrace");
+  c.scale(mapDpr, mapDpr);
+  c.fillStyle = "rgba(14,18,24,.76)"; c.fillRect(0, 0, MAP.w * MAP.s, MAP.h * MAP.s);
+  c.lineWidth = 0.8; c.strokeStyle = "rgba(255,255,255,.3)";
+  for (const [a, z0, , m, col] of scene.p) {
+    if (m === stair || (m === terrace && level === 1)) outline(c, a);
+    else if (col === FURNITURE && Math.abs(area(a)) >= 1.5 && z0 >= lv.floor - 1.6 && z0 < lv.floor + 8) outline(c, a);
+  }
+  c.lineWidth = 1.1; c.strokeStyle = "#f4f4f0";
+  for (const [ax, ay, bx, by] of lv.segs) outline(c, [ax, ay, bx, by], false);
+  c.lineWidth = 2; c.strokeStyle = "#7cc4ff";
+  for (const [a, , , kind, ext, lev] of scene.o) if (lev === level + 1 && ext && (kind === "window" || kind === "glass"))
+    outline(c, [(a[0] + a[6]) / 2, (a[1] + a[7]) / 2, (a[2] + a[4]) / 2, (a[3] + a[5]) / 2], false);
+  c.fillStyle = "#fff"; c.font = "600 12px -apple-system, system-ui, sans-serif"; c.textBaseline = "top";
+  c.fillText(level ? "2nd floor" : "1st floor", 8, 7);
+  const a = SURVEY_NORTH * Math.PI / 180, nx = MAP.w * MAP.s - 22, ny = 24, dx = Math.cos(a), dy = -Math.sin(a);     // north, from the survey
+  c.strokeStyle = "#ffd98a"; c.lineWidth = 1.6;
+  c.beginPath(); c.moveTo(nx - dx * 11, ny - dy * 11); c.lineTo(nx + dx * 11, ny + dy * 11); c.stroke();
+  c.fillStyle = "#ffd98a"; c.textAlign = "center"; c.textBaseline = "middle"; c.fillText("N", nx + dx * 18, ny + dy * 18);
+  return off;
+}
+function drawMap() {
+  if (!baked[planIndex]) return;
+  const level = P.feet >= 8 ? 1 : 0, key = planIndex + ":" + level;
+  if (key !== mapKey) { mapBase = buildMap(planIndex, level); mapKey = key; }
+  const c = mapEl.getContext("2d");
+  c.setTransform(1, 0, 0, 1, 0, 0);
+  c.clearRect(0, 0, mapEl.width, mapEl.height);
+  c.drawImage(mapBase, 0, 0);
+  c.setTransform(mapDpr, 0, 0, mapDpr, 0, 0);
+  const x = Math.max(6, Math.min(MAP.w * MAP.s - 6, mx(P.x))), y = Math.max(6, Math.min(MAP.h * MAP.s - 6, my(P.y)));
+  const fx = Math.sin(P.yaw), fy = -Math.cos(P.yaw), sx = -fy, sy = fx;     // facing, and its sideways, in map pixels
+  c.fillStyle = "#ffd24a"; c.strokeStyle = "rgba(0,0,0,.7)"; c.lineWidth = 1;
+  c.beginPath();
+  c.moveTo(x + fx * 9, y + fy * 9);
+  c.lineTo(x - fx * 5 + sx * 5.5, y - fy * 5 + sy * 5.5);
+  c.lineTo(x - fx * 2.5, y - fy * 2.5);
+  c.lineTo(x - fx * 5 - sx * 5.5, y - fy * 5 - sy * 5.5);
+  c.closePath(); c.fill(); c.stroke();
 }
 
 // ---- controls ----
