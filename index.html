@@ -1369,8 +1369,10 @@ const RT = {
   scale: 1,            // traced pixels per CSS pixel, for direct light and reflections
   indirectDiv: 4,      // bounced light is smooth: trace it this many times coarser
   maxPasses: 1500,     // stop working the GPU after this many
-  doneError: 0.025,    // finished when the picture would change by less than this if the passes doubled
-  minPasses: 24,
+  doneError: 0.0115,   // finished when a check finds the picture's noise below this (measureStability): about 0.0035 RMS from a converged render
+  minPasses: 96,
+  checkGrowth: 1.5,    // check again each time the passes grow by half
+  worstEase: 6,        // the worst pixels may be this many times noisier than doneError
 };
 const SHOW_BLOCKS = [[2, 16], [4, 8], [8, 4], [16, 2]];     // [below this many passes, light comes in as blocks of this many pixels]
 const EXPOSURE = { night: 0.105, day: 0.012, outside: 0.0011 };
@@ -1812,6 +1814,12 @@ function rtInit() {
       c = vec4(sum, 0.0, 0.0); }`, { gAlbedo: { value: null }, gNormal: { value: null }, gPos: { value: null }, mapE: { value: null }, mapI: { value: null }, tScale: { value: 1 }, iScale: { value: 1 }, size: { value: new THREE.Vector2() } });
   rt.small = floatTarget(40, 24, 1);
   rt.smallPrev = null;
+  // what the stopping check looks at: single pixels (noise shows pixel by pixel) of the direct and bounced light together
+  rt.stab = floatTarget(STAB_W, STAB_H, 1);
+  rt.stabQuad = fullScreen(`precision highp float; out vec4 c; uniform sampler2D mapE, mapI;
+    void main() { vec2 uv = (gl_FragCoord.xy - 0.5) / vec2(${STAB_W}.0, ${STAB_H}.0) + 0.5 / vec2(${STAB_W}.0, ${STAB_H}.0);
+      vec3 e = texelFetch(mapE, ivec2(uv * vec2(textureSize(mapE, 0))), 0).rgb, i = texelFetch(mapI, ivec2(uv * vec2(textureSize(mapI, 0))), 0).rgb;
+      c = vec4(e + i, 1.0); }`, { mapE: { value: null }, mapI: { value: null } });
   rtResize();
 }
 function rtWarmUp() {                   // compile the shaders in the background while the page starts, so turning real light on doesn't stall
@@ -2124,7 +2132,7 @@ function rtDaylight() {
 }
 
 function rtReset() {
-  rt.passes = 0; rt.finished = false; rt.err = 1; rt.bar = 0; rt.smallPrev = null; rt.nextCheck = 8; rt.needed = RT.maxPasses; rt.fc = null;
+  rt.passes = 0; rt.finished = false; rt.clean = false; rt.err = 1; rt.bar = 0; rt.smallPrev = null; rt.stabPrev = null; rt.checks = []; rt.nextCheck = 8; rt.needed = RT.maxPasses; rt.fc = null;
   const gl = renderer, clear = new THREE.Color(), a = gl.getClearAlpha(); gl.getClearColor(clear);
   gl.setClearColor(0x000000, 0);
   for (const t of [rt.gb, rt.a, rt.b, rt.f0, rt.f1, rt.s0, rt.s1, rt.am, rt.ia, rt.ib, rt.if0, rt.if1, rt.glA, rt.glB, rt.gf0, rt.gf1, rt.gg]) { gl.setRenderTarget(t); gl.clear(true, true, false); }
@@ -2194,24 +2202,41 @@ function rtDenoise() {
     let a = rt.gf0, b = rt.gf1;
     for (let i = 0; i < 3; i++) { D.map.value = a.texture; D.step_.value = 1 << i; gl.setRenderTarget(b); rt.denoise.render(gl); [a, b] = [b, a]; }
     rt.filteredG = a; D.gNormal.value = gt[1]; D.gPos.value = gt[2]; D.gScale.value = rt.W / rt.tw; }
-  if (n === rt.nextCheck) { measureStability(rt.filteredI); rt.nextCheck *= 2; }
+  if (n >= rt.nextCheck) { measureStability(); rt.nextCheck = Math.ceil(n * RT.checkGrowth); }
   if (rt.outside && (n === 4 || n === 12 || n === 32)) meterOutside();
   gl.setRenderTarget(null);
 }
-function measureStability(src) {        // noise falls with the square root of passes: comparing the picture now with the picture at half the passes predicts when it will be clean
-  const gl = renderer;
-  rt.meanQuad.material.uniforms.map.value = src.texture;
-  gl.setRenderTarget(rt.small); rt.meanQuad.render(gl);
-  const a = new Float32Array(40 * 24 * 4);
-  gl.readRenderTargetPixels(rt.small, 0, 0, 40, 24, a);
-  if (rt.smallPrev) {
-    let sum = 0, total = 0; const lm = (b, i) => 0.2126 * b[i] + 0.7152 * b[i + 1] + 0.0722 * b[i + 2];
-    for (let i = 0; i < a.length; i += 4) { const x = lm(a, i), y = lm(rt.smallPrev, i), wt = Math.pow(Math.max(y, x) + 1e-3, -0.5); sum += Math.abs(x - y) * wt; total += (x + y) / 2 * wt; }
-    rt.err = sum / (total || 1);
-    rt.needed = Math.min(RT.maxPasses, Math.max(rt.outside ? 48 : RT.minPasses, rt.passes * Math.pow(rt.err / RT.doneError, 2)));
-  }
-  rt.smallPrev = a;
+// How noisy the picture still is, from how much it changed since the last check. Noise falls as 1/sqrt(passes): between the picture at
+// m passes and at n, the difference has the size of noise(n) * sqrt(n/m - 1), so noise(n) = difference / sqrt(n/m - 1). Measured on single
+// pixels of the direct and bounced light together, as the average and as the worst pixels (speckle is what you notice), at every check.
+// The render finishes only at a check that finds it clean; the predicted pass count only drives the progress bar.
+const STAB_W = 160, STAB_H = 96;
+function measureStability() {
+  const gl = renderer, q = rt.stabQuad.material.uniforms;
+  q.mapE.value = rt.filtered.texture; q.mapI.value = rt.filteredI.texture;
+  gl.setRenderTarget(rt.stab); rt.stabQuad.render(gl);
+  const a = new Float32Array(STAB_W * STAB_H * 4);
+  gl.readRenderTargetPixels(rt.stab, 0, 0, STAB_W, STAB_H, a);
   gl.setRenderTarget(null);
+  // brightness as it will look on screen (light times a typical wall colour over pi, exposed, rolled off), so a bright strip that's white either way doesn't hold the render up
+  const ex = rt.compose.material.uniforms.exposure.value * 0.22, lm = (b, i) => { const u = ex * (0.2126 * b[i] + 0.7152 * b[i + 1] + 0.0722 * b[i + 2]); return u / (1 + u); };
+  if (rt.stabPrev) {
+    const k = 1 / Math.sqrt(Math.max(0.05, rt.passes / rt.stabPrevPasses - 1)), n = a.length / 4, rel = new Float32Array(n);
+    let sum = 0, total = 0, avg = 0;
+    for (let i = 0; i < a.length; i += 4) avg += lm(a, i) / n;
+    for (let i = 0, j = 0; i < a.length; i += 4, j++) {
+      const x = lm(a, i), y = lm(rt.stabPrev, i), wt = Math.pow(Math.max(x, y) + 1e-3, -0.5);
+      sum += Math.abs(x - y) * wt; total += (x + y) / 2 * wt;
+      rel[j] = Math.abs(x - y) / (Math.max(x, y) + 0.1 * avg);       // a pixel much darker than the picture: its noise counts as the picture's
+    }
+    rel.sort();
+    const mean = k * sum / (total || 1), worst = k * rel[Math.floor(n * 0.98)] / RT.worstEase;      // the worst 2% of pixels
+    rt.errParts = [mean, worst]; rt.checks.push([rt.passes, +mean.toFixed(4), +worst.toFixed(4)]);
+    rt.err = Math.max(mean, worst);
+    rt.needed = Math.min(RT.maxPasses, Math.max(rt.outside ? 48 : RT.minPasses, rt.passes * Math.pow(rt.err / RT.doneError, 2)));
+    if (rt.err <= RT.doneError && rt.passes >= (rt.outside ? 48 : RT.minPasses)) rt.clean = true;
+  }
+  rt.stabPrev = a; rt.stabPrevPasses = rt.passes;
 }
 function measureFc() {                 // foot-candles on what's in view, read from the light that was traced: floors and table tops, and walls
   const gl = renderer, m = rt.fcQuad.material.uniforms, gt = rt.gb.texture;
@@ -2272,7 +2297,7 @@ function ptStepInner() {
   if (!rt.finished) {                                       // stop tracing once it's clean: more passes don't change what you see
     rtPass(); rtDenoise();
     rt.bar = Math.max(rt.bar, Math.min(0.99, rt.passes / rt.needed));
-    if (rt.passes >= rt.needed) { rt.finished = true; rt.bar = 1; rt.finishMs = performance.now() - rt.startMs; measureFc(); showPt(); }
+    if (rt.clean || rt.passes >= RT.maxPasses) { rt.finished = true; rt.bar = 1; rt.finishMs = performance.now() - rt.startMs; measureFc(); showPt(); }
   }
   rt.shown = rt.finished ? ptShowKey() : null;
   if (rt.passes < 8) renderer.render(scene3, camera);      // the fast view, under the real light as it comes in
