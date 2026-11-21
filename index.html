@@ -1098,30 +1098,43 @@ function overlays() {
 }
 
 // ==== doors.js ====
-// Doors that open as you come near.
+// Doors that open when you're near one and looking at it (owner, 2026-11-21).
 const DOOR_REACH = 5.5, DOOR_SPEED = 3;       // feet; quarter turns per second
-// a closet's doors open only when you're facing them and within 6" of them (owner); once open they stay open until
-// you're both more than CLOSET_LEAVE from them and no longer facing them (owner, 2026-11-11); other doors open as you come near
+// A door opens while you're within its reach and looking at it (the nearest point of its opening within DOOR_LOOK of
+// straight ahead), and stays open while you stand in its opening; it closes once you've passed through (it's behind
+// you) or look away. A closet's doors open only when you're facing them and within 6" of them (owner); once open they
+// stay open until you're both more than CLOSET_LEAVE from them and no longer facing them (owner, 2026-11-11).
+const DOOR_LOOK = 0.64, DOOR_IN = 0.4;        // cos 50°; how far either side of the opening counts as standing in it
 const CLOSET_GAP = 0.5, CLOSET_FACING = 0.5, CLOSET_LEAVE = 3;
+// the nearest point on a segment from (x0, y0) along unit (ux, uy) for len: [distance, facing (cos), along, across]
+function nearSeg(x0, y0, ux, uy, len) {
+  const along = (P.x - x0) * ux + (P.y - y0) * uy, across = -(P.x - x0) * uy + (P.y - y0) * ux;
+  const t = Math.max(0, Math.min(len, along));
+  const qx = x0 + ux * t - P.x, qy = y0 + uy * t - P.y, d = Math.hypot(qx, qy);
+  return [d, d < 1e-6 ? 1 : (Math.sin(P.yaw) * qx + Math.cos(P.yaw) * qy) / d, along, across];
+}
 function closetOpen(s) {
-  const t = Math.max(0, Math.min(s.w, (P.x - s.hx) * s.ax + (P.y - s.hy) * s.ay));      // nearest point on the shut leaf
-  const qx = s.hx + s.ax * t - P.x, qy = s.hy + s.ay * t - P.y, d = Math.hypot(qx, qy);
-  const facing = d < 1e-6 || (Math.sin(P.yaw) * qx + Math.cos(P.yaw) * qy) / d > CLOSET_FACING;
+  const [d, f] = nearSeg(s.hx, s.hy, s.ax, s.ay, s.w), facing = f > CLOSET_FACING;
   if (d < R + CLOSET_GAP && facing) s.held = true;
   else if (d > R + CLOSET_LEAVE && !facing) s.held = false;
   return s.held;
+}
+function doorOpen(s, x0, y0, ux, uy, len, reach) {
+  const [d, f, along, across] = nearSeg(x0, y0, ux, uy, len);
+  const inOpening = along > -0.2 && along < len + 0.2 && Math.abs(across) < R + DOOR_IN;
+  return inOpening || (d < reach && f > DOOR_LOOK);
 }
 function updateDoors(dt, w = world) {
   if (!w) return;
   for (const s of w.userData.swings) {
     const onFloor = Math.abs(P.feet - s.z0) < 3.5;
     if (s.closet && !onFloor) s.held = false;
-    const close = onFloor && (s.closet ? closetOpen(s) : Math.hypot(P.x - s.cx, P.y - s.cy) < s.reach);
+    const close = onFloor && (s.closet ? closetOpen(s) : doorOpen(s, s.hx, s.hy, s.ax, s.ay, s.w, s.reach));
     s.open += Math.max(-dt * DOOR_SPEED, Math.min(dt * DOOR_SPEED, (close ? 1 : 0) - s.open));
     s.pivot.rotation.y = s.a0 + s.sign * s.open * Math.PI / 2;
   }
   for (const s of w.userData.slides) {
-    const close = Math.abs(P.feet - s.z0) < 3.5 && Math.hypot(P.x - s.cx, P.y - s.cy) < s.reach;
+    const close = Math.abs(P.feet - s.z0) < 3.5 && doorOpen(s, s.cx - s.ux * s.w / 2, s.cy - s.uy * s.w / 2, s.ux, s.uy, s.w, s.reach);
     s.open += Math.max(-dt * DOOR_SPEED, Math.min(dt * DOOR_SPEED, (close ? 1 : 0) - s.open));
     if (s.roll) s.g.scale.y = 1 - 0.96 * s.open;
     else s.g.position.set(s.dx * s.open, 0, -s.dy * s.open);
@@ -1553,7 +1566,8 @@ function buildMeshes(scene) {
     group.add(g);
     if (roll) g.position.y = top;
     const mid = [cx, cy, (z0 + top) / 2];
-    return { g, mats, lit: lightAt(mid, [1, 0, 0], levelOf(mid[2])), cx, cy, z0, top, dx, dy, roll, reach: Math.max(DOOR_REACH, w / 2 + 3), open: 0 };
+    const tl = Math.hypot(dx, dy), ux = tl ? dx / tl : 1, uy = tl ? dy / tl : 0;      // along the opening (a roll-up's runs along the street)
+    return { g, mats, lit: lightAt(mid, [1, 0, 0], levelOf(mid[2])), cx, cy, z0, top, dx, dy, roll, w, ux, uy, reach: Math.max(DOOR_REACH, w / 2 + 3), open: 0 };
   });
   updateDoors(1, group);
   group.userData.ms = Math.round(performance.now() - t0);
@@ -1653,7 +1667,7 @@ const SHOW_BLOCKS = [[2, 16], [4, 8], [8, 4], [16, 2]];     // [below this many 
 const EXPOSURE = { night: 0.105, day: 0.012, outside: 0.0004 };
 const LED_WARM = [1.25, 0.96, 0.625];                       // 2700K, scaled to a luminance of 1
 const CAMERA_WB = [1.18, 0.97, 0.72];                        // a camera's white balance at night: warm light still looks warm, but not orange
-const lightSets = { option: 0 };
+const lightSets = { option: 3 };   // cove + pendants (MAIN_LIGHT; owner, 2026-11-21)
 const glf = (v) => v.toFixed(4);
 // the house's heights for the shaders: which floor a height is on, and where indoors stops (in the roof)
 const GLSL_SITE = `const float PARTY_X = ${glf(SITE.partyX)}, F2_SPLIT = ${glf(SITE.f2Floor - 0.01)};
@@ -2955,7 +2969,9 @@ function selfTest() {
   hold("KeyW", 5); out.upTheStairs = at();
   place(3); P.yaw = -Math.PI / 2; hold("KeyW", 4); out.intoLotLineWall = at();
   P.x = 32; P.y = 18.1; P.feet = 0.01; P.yaw = -Math.PI / 2; P.grounded = true; hold("KeyW", 3); out.intoBasementDoor = at();
-  P.x = 25.6; P.y = 2; P.feet = 0.01; updateDoors(1); out.doorsOpenInEntry = world ? world.userData.swings.filter((s) => s.open > 0.9).length : null;
+  const openSwings = () => world ? world.userData.swings.filter((s) => s.open > 0.9).length : null;
+  out.doorsByLook = [0, Math.PI / 2, Math.PI, -Math.PI / 2].map((yaw) => { P.x = 25.6; P.y = 2; P.feet = 0.01; P.yaw = yaw; updateDoors(1); return openSwings(); });   // only the ones you look at
+  P.x = 25.6; P.y = 2; P.feet = 0.01; P.yaw = 0; updateDoors(1); out.doorsOpenInEntry = world ? world.userData.swings.filter((s) => s.open > 0.9).length : null;
   out.slidesOpenInEntry = world ? world.userData.slides.filter((s) => s.open > 0.9).length : null;
   P.x = 9; P.y = -3; P.feet = -1.5; updateDoors(1); out.rollupOpenAtStreet = world ? world.userData.slides.filter((s) => s.roll && s.open > 0.9).length : null;
   P.x = 12; P.y = 12; P.feet = 10.01; updateDoors(1); out.doorsOpenFarAway = world ? world.userData.swings.filter((s) => s.open > 0.9).length : null;
@@ -2966,7 +2982,7 @@ function selfTest() {
   P.yaw = Math.PI / 2; hold("KeyA", 0.5); out.strafeLeftFacingEast = at();
   const pad = (key) => document.querySelector(`#touch [data-key=${key}]`), fire = (el, type) => el.dispatchEvent(new PointerEvent(type, { bubbles: true }));
   fire(pad("KeyW"), "pointerdown"); const held = !!keys.KeyW; fire(pad("KeyW"), "pointerup"); out.padHoldsKey = [held, !!keys.KeyW];
-  P.x = 26.3; P.y = 16.5; P.feet = 10.01; updateDoors(1); out.doorsOpenAtTopOfStair = world ? world.userData.swings.filter((s) => s.open > 0.9).length : null;
+  P.x = 26.3; P.y = 16.5; P.feet = 10.01; P.yaw = 0; updateDoors(1); out.doorsOpenAtTopOfStair = world ? world.userData.swings.filter((s) => s.open > 0.9).length : null;
   P.x = 50.5; P.y = 10.5; P.feet = 10.01; P.yaw = 0; updateDoors(1); const shutFar = world ? world.userData.swings.filter((s) => s.open > 0.9).length : null;
   P.y = 12.9; updateDoors(1); const openFacing = world ? world.userData.swings.filter((s) => s.open > 0.9).length : null;
   P.yaw = Math.PI; updateDoors(1); out.closetOpensOnlyClose = world ? [shutFar, openFacing, world.userData.swings.filter((s) => s.open > 0.9).length] : null;     // shut, open facing it, shut turned away
